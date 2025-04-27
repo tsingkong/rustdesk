@@ -98,6 +98,8 @@ if(VCPKG_TARGET_IS_LINUX)
 ")
 
     if(VCPKG_TARGET_ARCHITECTURE STREQUAL "arm")
+    elseif(VCPKG_TARGET_ARCHITECTURE STREQUAL "loong64")
+    elseif(VCPKG_TARGET_ARCHITECTURE STREQUAL "loongarch64")
     else()
         string(APPEND OPTIONS "\
 --enable-cuda \

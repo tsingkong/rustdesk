@@ -37,10 +37,12 @@ lazy_static::lazy_static! {
 struct UIHostHandler;
 
 pub fn start(args: &mut [String]) {
+    let has_sciter = false;
     #[cfg(target_os = "macos")]
     crate::platform::delegate::show_dock();
     #[cfg(all(target_os = "linux", feature = "inline"))]
     {
+        log::debug!("try to call sciter::set_library\n");
         let app_dir = std::env::var("APPDIR").unwrap_or("".to_string());
         let mut so_path = "/usr/share/rustdesk/libsciter-gtk.so".to_owned();
         for (prefix, dir) in [
@@ -57,7 +59,9 @@ pub fn start(args: &mut [String]) {
                 break;
             }
         }
+        log::debug!("sciter::set_library:{}, \n", so_path);
         sciter::set_library(&so_path).ok();
+        has_sciter = true;
     }
     #[cfg(windows)]
     // Check if there is a sciter.dll nearby.
@@ -68,6 +72,7 @@ pub fn start(args: &mut [String]) {
                 // Try to set the sciter dll.
                 let p = sciter_dll_path.to_string_lossy().to_string();
                 log::debug!("Found dll:{}, \n {:?}", p, sciter::set_library(&p));
+                has_sciter = true;
             }
         }
     }
@@ -77,6 +82,10 @@ pub fn start(args: &mut [String]) {
     allow_err!(sciter::set_options(sciter::RuntimeOptions::GfxLayer(
         sciter::GFX_LAYER::WARP
     )));
+
+    if !has_sciter {
+        return;
+    }
     use sciter::SCRIPT_RUNTIME_FEATURES::*;
     allow_err!(sciter::set_options(sciter::RuntimeOptions::ScriptFeatures(
         ALLOW_FILE_IO as u8 | ALLOW_SOCKET_IO as u8 | ALLOW_EVAL as u8 | ALLOW_SYSINFO as u8
