@@ -3888,8 +3888,8 @@ checksum = "9a3a5bfb195931eeb336b2a7b4d761daec841b97f947d34394601737a7bba5e4"
 
 [[package]]
 name = "hwcodec"
-version = "0.7.1"
-source = "git+https://github.com/rustdesk-org/hwcodec#778df1f99597722473b29443bac22ae6c23946fe"
+version = "0.8.0"
+source = "git+https://github.com/tsingkong/rustdesk-hwcodec#1ab4eeebe782d9f47afca47c8441e9fa33716deb"
 dependencies = [
  "bindgen 0.59.2",
  "cc",
@@ -9536,7 +9536,7 @@ dependencies = [
 [[package]]
 name = "webm"
 version = "1.1.0"
-source = "git+https://github.com/rustdesk-org/rust-webm#d2c4d3ac133c7b0e4c0f656da710b48391981e64"
+source = "git+https://github.com/tsingkong/rust-webm#65d3d45fff918afbc13032c196d633d2da1be8fb"
 dependencies = [
  "webm-sys",
 ]
@@ -9544,7 +9544,7 @@ dependencies = [
 [[package]]
 name = "webm-sys"
 version = "1.0.4"
-source = "git+https://github.com/rustdesk-org/rust-webm#d2c4d3ac133c7b0e4c0f656da710b48391981e64"
+source = "git+https://github.com/tsingkong/rust-webm#65d3d45fff918afbc13032c196d633d2da1be8fb"
 dependencies = [
  "cc",
 ]
