@@ -25,13 +25,14 @@ osx = platform.platform().startswith(
     'Darwin') or platform.platform().startswith("macOS")
 hbb_name = 'rustdesk' + ('.exe' if windows else '')
 exe_path = 'target/release/' + hbb_name
+loong64 = platform.machine().lower() in ('loong64', 'loongarch64')
 if windows:
     win_arch = 'arm64' if platform.machine().lower() in ('arm64', 'aarch64') else 'x64'
     flutter_build_dir = f'build/windows/{win_arch}/runner/Release/'
 elif osx:
     flutter_build_dir = 'build/macos/Build/Products/Release/'
 else:
-    flutter_build_dir = 'build/linux/x64/release/bundle/'
+    flutter_build_dir = 'build/linux/loong64/release/bundle/'if loong64 else 'build/linux/x64/release/bundle/'
 flutter_build_dir_2 = f'flutter/{flutter_build_dir}'
 skip_cargo = False
 
@@ -39,7 +40,7 @@ skip_cargo = False
 def get_deb_arch() -> str:
     custom_arch = os.environ.get("DEB_ARCH")
     if custom_arch is None:
-        return "amd64"
+        return "loong64" if loong64 else "amd64"
     return custom_arch
 
 def get_deb_extra_depends() -> str:
