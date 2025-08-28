@@ -178,6 +178,7 @@ pub enum AuthConnType {
 #[derive(Clone, Debug)]
 enum TerminalUserToken {
     SelfUser,
+    #[cfg(target_os = "windows")]
     CurrentLogonUser(crate::terminal_service::UserToken),
 }
 
@@ -186,6 +187,7 @@ impl TerminalUserToken {
     fn to_terminal_service_token(&self) -> Option<crate::terminal_service::UserToken> {
         match self {
             TerminalUserToken::SelfUser => None,
+            #[cfg(target_os = "windows")]
             TerminalUserToken::CurrentLogonUser(token) => Some(*token),
         }
     }
@@ -631,7 +633,22 @@ impl Connection {
                         }
                         #[cfg(target_os = "windows")]
                         ipc::Data::ClipboardFile(clip) => {
-                            allow_err!(conn.stream.send(&clip_2_msg(clip)).await);
+                            match clip {
+                                clipboard::ClipboardFile::Files { files } => {
+                                    let files = files.into_iter().map(|(f, s)| {
+                                        (f, s as i64)
+                                    }).collect::<Vec<_>>();
+                                    conn.post_file_audit(
+                                        FileAuditType::RemoteSend,
+                                        "",
+                                        files,
+                                        json!({}),
+                                    );
+                                }
+                                _ => {
+                                    allow_err!(conn.stream.send(&clip_2_msg(clip)).await);
+                                }
+                            }
                         }
                         ipc::Data::PrivacyModeState((_, state, impl_key)) => {
                             let msg_out = match state {
@@ -1318,7 +1335,7 @@ impl Connection {
 
         #[cfg(not(target_os = "android"))]
         {
-            pi.hostname = hbb_common::whoami::hostname();
+            pi.hostname = crate::whoami_hostname();
             pi.platform = hbb_common::whoami::platform().to_string();
         }
         #[cfg(target_os = "android")]
@@ -2461,14 +2478,25 @@ impl Connection {
                 }
                 #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
                 Some(message::Union::Cliprdr(clip)) => {
-                    if let Some(clip) = msg_2_clip(clip) {
+                    if let Some(cliprdr::Union::Files(files)) = &clip.union {
+                        self.post_file_audit(
+                            FileAuditType::RemoteReceive,
+                            "",
+                            files
+                                .files
+                                .iter()
+                                .map(|f| (f.name.clone(), f.size as i64))
+                                .collect::<Vec<(String, i64)>>(),
+                            json!({}),
+                        );
+                    } else if let Some(clip) = msg_2_clip(clip) {
                         #[cfg(target_os = "windows")]
                         {
                             self.send_to_cm(ipc::Data::ClipboardFile(clip));
                         }
                         #[cfg(feature = "unix-file-copy-paste")]
                         if crate::is_support_file_copy_paste(&self.lr.version) {
-                            let mut out_msg = None;
+                            let mut out_msgs = vec![];
 
                             #[cfg(target_os = "macos")]
                             if clipboard::platform::unix::macos::should_handle_msg(&clip) {
@@ -2483,7 +2511,7 @@ impl Connection {
                                         });
                                 }
                             } else {
-                                out_msg = unix_file_clip::serve_clip_messages(
+                                out_msgs = unix_file_clip::serve_clip_messages(
                                     ClipboardSide::Host,
                                     clip,
                                     self.inner.id(),
@@ -2492,14 +2520,31 @@ impl Connection {
 
                             #[cfg(not(target_os = "macos"))]
                             {
-                                out_msg = unix_file_clip::serve_clip_messages(
+                                out_msgs = unix_file_clip::serve_clip_messages(
                                     ClipboardSide::Host,
                                     clip,
                                     self.inner.id(),
                                 );
                             }
 
-                            if let Some(msg) = out_msg {
+                            for msg in out_msgs.into_iter() {
+                                if let Some(message::Union::Cliprdr(cliprdr)) = msg.union.as_ref() {
+                                    if let Some(cliprdr::Union::Files(files)) =
+                                        cliprdr.union.as_ref()
+                                    {
+                                        self.post_file_audit(
+                                            FileAuditType::RemoteSend,
+                                            "",
+                                            files
+                                                .files
+                                                .iter()
+                                                .map(|f| (f.name.clone(), f.size as i64))
+                                                .collect::<Vec<(String, i64)>>(),
+                                            json!({}),
+                                        );
+                                        continue;
+                                    }
+                                }
                                 self.send(msg).await;
                             }
                         }
@@ -2703,7 +2748,11 @@ impl Connection {
                             }
                             Some(file_action::Union::SendConfirm(r)) => {
                                 if let Some(job) = fs::get_job(r.id, &mut self.read_jobs) {
-                                    job.confirm(&r);
+                                    job.confirm(&r).await;
+                                } else {
+                                    if let Ok(sc) = r.write_to_bytes() {
+                                        self.send_fs(ipc::FS::SendConfirm(sc));
+                                    }
                                 }
                             }
                             Some(file_action::Union::Rename(r)) => {
@@ -2747,6 +2796,7 @@ impl Connection {
                         file_size: d.file_size,
                         last_modified: d.last_modified,
                         is_upload: true,
+                        is_resume: d.is_resume,
                     }),
                     Some(file_response::Union::Error(e)) => {
                         self.send_fs(ipc::FS::WriteError {
@@ -3314,6 +3364,7 @@ impl Connection {
                     {
                         return;
                     }
+                    #[allow(unused_mut)]
                     let mut record_changed = true;
                     #[cfg(windows)]
                     if virtual_display_manager::amyuni_idd::is_my_display(&name) {
@@ -3935,7 +3986,6 @@ impl Connection {
     #[cfg(feature = "unix-file-copy-paste")]
     async fn handle_file_clip(&mut self, clip: clipboard::ClipboardFile) {
         let is_stopping_allowed = clip.is_stopping_allowed();
-        let is_keyboard_enabled = self.peer_keyboard_enabled();
         let file_transfer_enabled = self.file_transfer_enabled();
         let stop = is_stopping_allowed && !file_transfer_enabled;
         log::debug!(
@@ -4626,6 +4676,7 @@ mod raii {
                 .send((conn_count, remote_count)));
         }
 
+        #[cfg(windows)]
         pub fn non_port_forward_conn_count() -> usize {
             AUTHED_CONNS
                 .lock()
