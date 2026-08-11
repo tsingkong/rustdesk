@@ -28,6 +28,151 @@ lazy_static::lazy_static! {
     static ref SYNC_DISPLAYS: Arc<Mutex<SyncDisplaysInfo>> = Default::default();
 }
 
+#[cfg(target_os = "linux")]
+lazy_static::lazy_static! {
+    static ref WAYLAND_UINPUT_RECT: Mutex<WaylandUinputRect> = Default::default();
+    static ref WAYLAND_LAYOUT: Mutex<WaylandLayout> = Default::default();
+}
+
+#[cfg(target_os = "linux")]
+const WAYLAND_LAYOUT_CHECK_INTERVAL: Duration = Duration::from_millis(1500);
+
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct WaylandUinputRect {
+    rect: Option<(i32, i32, i32, i32)>,
+    last_check: Option<std::time::Instant>,
+}
+
+// Per-display layout used to correct injected coordinates when the compositor moves a
+// monitor mid-session. The client keeps sending coordinates offset by the layout it was
+// told at session init (`baseline`); we remap them onto the current layout (`live`).
+// https://github.com/rustdesk/rustdesk/issues/15601
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct WaylandLayout {
+    baseline: Vec<scrap::wayland::display::DisplayRect>,
+    live: Vec<scrap::wayland::display::DisplayRect>,
+}
+
+// Whether `live` differs from `baseline`. Read on every mouse move, so it is an atomic:
+// the common (no-drift) case never touches the layout mutex.
+#[cfg(target_os = "linux")]
+static WAYLAND_LAYOUT_DRIFTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_os = "linux")]
+pub(super) fn set_wayland_uinput_rect(rect: (i32, i32, i32, i32)) {
+    WAYLAND_UINPUT_RECT.lock().unwrap().rect = Some(rect);
+}
+
+// The uinput ABS range currently programmed into the device, for the DRM path's "reapply only when
+// it changed" check. The PipeWire path compares it inline in refresh_wayland_uinput_rect_if_changed.
+#[cfg(all(target_os = "linux", feature = "drm"))]
+pub(super) fn wayland_uinput_rect() -> Option<(i32, i32, i32, i32)> {
+    WAYLAND_UINPUT_RECT.lock().unwrap().rect
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn set_wayland_layout_baseline(baseline: Vec<scrap::wayland::display::DisplayRect>) {
+    WAYLAND_LAYOUT_DRIFTED.store(false, Ordering::Relaxed);
+    let mut lock = WAYLAND_LAYOUT.lock().unwrap();
+    lock.baseline = baseline;
+    lock.live.clear();
+}
+
+// Remap an injected coordinate onto the live compositor layout when it has drifted from
+// what the client was told at session init. Lock-free no-op otherwise.
+#[cfg(target_os = "linux")]
+pub(super) fn remap_wayland_uinput_coord(x: i32, y: i32) -> (i32, i32) {
+    if !WAYLAND_LAYOUT_DRIFTED.load(Ordering::Relaxed) {
+        return (x, y);
+    }
+    let lock = WAYLAND_LAYOUT.lock().unwrap();
+    scrap::wayland::display::remap_to_live_layout(x, y, &lock.baseline, &lock.live)
+}
+
+// The uinput absolute range is set when the session inits. If the compositor layout
+// changes afterwards (monitor scale/position change, or a portal virtual output
+// appearing once the capture starts), injected coordinates get rescaled by the stale
+// range and land offset, https://github.com/rustdesk/rustdesk/issues/15601
+#[cfg(target_os = "linux")]
+fn refresh_wayland_uinput_rect_if_changed() {
+    if is_x11() || !crate::input_service::wayland_use_uinput() {
+        return;
+    }
+    {
+        let mut lock = WAYLAND_UINPUT_RECT.lock().unwrap();
+        if let Some(last_check) = lock.last_check {
+            if last_check.elapsed() < WAYLAND_LAYOUT_CHECK_INTERVAL {
+                return;
+            }
+        }
+        lock.last_check = Some(std::time::Instant::now());
+    }
+    let Some((rect, live_rects)) = scrap::wayland::display::get_layout_for_uinput_live() else {
+        return;
+    };
+    // Refresh the per-display layout every poll: monitor origins can shift (e.g. two
+    // displays swap positions) without changing the overall desktop rect, and the mouse
+    // path needs the current per-display geometry to correct coordinates.
+    let drifted = {
+        let mut layout = WAYLAND_LAYOUT.lock().unwrap();
+        let drifted = !layout.baseline.is_empty()
+            && !live_rects.is_empty()
+            && layout.baseline != live_rects;
+        layout.live = live_rects;
+        drifted
+    };
+    // The remap corrects for per-display origin shifts; the uinput ABS range corrects for
+    // the overall bounding box. Only enable the remap once the range matches the live
+    // layout, otherwise moves would be remapped into a range the device is not yet using.
+    // A drift with no bbox change (origins swapped) needs no range update and enables now.
+    let mut range_ok = WAYLAND_UINPUT_RECT.lock().unwrap().rect == Some(rect);
+    if !range_ok {
+        let (minx, maxx, miny, maxy) = rect;
+        log::info!(
+            "desktop layout changed, update mouse resolution: ({}, {}), ({}, {})",
+            minx,
+            maxx,
+            miny,
+            maxy
+        );
+        match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => {
+                // Bound the IPC wait, this runs on the display service loop and
+                // `set_resolution()` has no timeout on the response read.
+                // timeout must be built inside the runtime, or it panics
+                // "there is no reactor running". See clipboard_service.rs.
+                match rt.block_on(async {
+                    timeout(
+                        3_000,
+                        crate::input_service::update_mouse_resolution(minx, maxx, miny, maxy),
+                    )
+                    .await
+                }) {
+                    // Record the rect only after a successful apply, so a transient
+                    // failure is retried on the next check.
+                    Ok(Ok(())) => {
+                        WAYLAND_UINPUT_RECT.lock().unwrap().rect = Some(rect);
+                        range_ok = true;
+                    }
+                    Ok(Err(err)) => log::error!("Failed to update mouse resolution: {}", err),
+                    Err(err) => log::error!("Failed to update mouse resolution: {}", err),
+                }
+            }
+            Err(err) => {
+                log::error!("Failed to build tokio runtime: {}", err);
+            }
+        }
+    }
+    // Publish the flag last: a `true` read is always backed by a current `live` and a
+    // matching uinput range. A failed range apply leaves this false and retries next poll.
+    WAYLAND_LAYOUT_DRIFTED.store(drifted && range_ok, Ordering::Relaxed);
+}
+
 // https://github.com/rustdesk/rustdesk/pull/8537
 static TEMP_IGNORE_DISPLAYS_CHANGED: AtomicBool = AtomicBool::new(false);
 
@@ -190,6 +335,16 @@ fn check_get_displays_changed_msg() -> Option<Message> {
     #[cfg(target_os = "linux")]
     {
         if !is_x11() {
+            // On the DRM/KMS capture path the PipeWire enumeration (which is what feeds
+            // `SYNC_DISPLAYS` via `check_update_displays`) is bypassed, so populate the sync list
+            // from the DRM display list here. Without this the display service broadcasts an empty
+            // list that overwrites the login peer-info displays and the client shows "No displays".
+            #[cfg(feature = "drm")]
+            if super::drm_capturer::is_available_cached() {
+                if let Some(displays) = super::drm_capturer::get_display_infos() {
+                    SYNC_DISPLAYS.lock().unwrap().check_changed(&displays);
+                }
+            }
             return get_displays_msg();
         }
     }
@@ -231,6 +386,12 @@ fn run(sp: EmptyExtraFieldService) -> ResultType<()> {
             sp.send(msg_out);
             log::info!("Displays changed");
         }
+
+        #[cfg(target_os = "linux")]
+        if sp.has_subscribes() {
+            refresh_wayland_uinput_rect_if_changed();
+        }
+
         std::thread::sleep(Duration::from_millis(300));
     }
 
@@ -288,6 +449,33 @@ pub(super) fn get_sync_displays() -> Vec<DisplayInfo> {
 
 pub(super) fn get_display_info(idx: usize) -> Option<DisplayInfo> {
     SYNC_DISPLAYS.lock().unwrap().displays.get(idx).cloned()
+}
+
+// True when at least one advertised (synced) display is NOT served by the DRM/KMS capture path,
+// i.e. a mixed DRM + PipeWire session. The cursor service (platform::linux::get_cursor /
+// get_cursor_data) uses this to decide whether a hidden DRM hardware-cursor sentinel is
+// authoritative: in a pure-DRM session it is (the pointer is genuinely off every captured CRTC),
+// but in a mixed session the sentinel only means the pointer moved onto a PipeWire-served display,
+// whose cursor must come from the normal path instead of being hidden everywhere.
+//
+// When DRM capture is active the advertised list is enumerated from the DRM display list, so a DRM
+// list shorter than the synced list means at least one advertised display is served by PipeWire.
+#[cfg(all(target_os = "linux", feature = "drm"))]
+pub fn has_non_drm_backed_display() -> bool {
+    match super::drm_capturer::display_count_and_any_demoted() {
+        // A display served by PipeWire is either ABSENT from the DRM list (a shorter count, e.g. a
+        // pure-portal display) or PRESENT-BUT-DEMOTED (kept in place at the same index and marked
+        // offline so the index space stays aligned -- see get_display_infos). The count check alone
+        // misses the demotion case (same count), so a demoted display is treated as non-DRM-backed
+        // too. This is what gates the hidden-cursor sentinel: it stays authoritative only in a
+        // pure-DRM session. The scalar accessor is deliberate: this is polled every cursor tick
+        // while the sentinel is active, and cloning + geometry-augmenting the whole list per tick
+        // (what get_display_infos does) answered the same two facts.
+        Some((count, any_demoted)) => {
+            count < SYNC_DISPLAYS.lock().unwrap().displays.len() || any_demoted
+        }
+        None => false,
+    }
 }
 
 // Display to DisplayInfo
