@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <X11/Xlib.h>
 #include "my_application.h"
 
 #define RUSTDESK_LIB_PATH "librustdesk.so"
@@ -66,6 +67,9 @@ bool flutter_rustdesk_core_main() {
 }
 
 int main(int argc, char** argv) {
+  // 关键：在任何 GTK、GDK、Flutter 初始化之前，强行初始化 X11 多线程支持
+  XInitThreads();
+
   if (!flutter_rustdesk_core_main()) {
       return 0;
   }
